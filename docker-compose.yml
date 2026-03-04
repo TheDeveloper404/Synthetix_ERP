@@ -1,0 +1,86 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:7.0
+    container_name: synthetix-erp_mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:-admin}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-password}
+      MONGO_INITDB_DATABASE: ${DB_NAME:-synthetix}
+    volumes:
+      - synthetix_mongodb_data:/data/db
+    ports:
+      - "127.0.0.1:27017:27017"
+    networks:
+      - synthetix-erp_network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Backend/API Service (port 3080)
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: synthetix-erp_backend
+    restart: unless-stopped
+    ports:
+      - "3080:3000"
+    environment:
+      NODE_ENV: production
+      MONGO_URL: mongodb://${MONGO_USER:-admin}:${MONGO_PASSWORD:-password}@mongodb:27017/${DB_NAME:-synthetix}?authSource=admin
+      DB_NAME: ${DB_NAME:-synthetix}
+      JWT_SECRET: ${JWT_SECRET}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      RESEND_API_KEY: ${RESEND_API_KEY}
+      RESEND_FROM_EMAIL: ${RESEND_FROM_EMAIL:-notifications@yourdomain.com}
+      NEXT_PUBLIC_BASE_URL: ${NEXT_PUBLIC_BASE_URL:-http://localhost:3081}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3081}
+      DEMO_MODE: ${DEMO_MODE:-true}
+      AGENT_PORT_BASE: ${AGENT_PORT_BASE:-3082}
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    networks:
+      - synthetix-erp_network
+
+  # Frontend Service (port 3081)
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: synthetix-erp_frontend
+    restart: unless-stopped
+    ports:
+      - "3081:3000"
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:3080}
+      NEXT_PUBLIC_BASE_URL: ${NEXT_PUBLIC_BASE_URL:-http://localhost:3081}
+    depends_on:
+      - backend
+    networks:
+      - synthetix-erp_network
+
+  # Future services can be added on ports 3082+
+  # Example:
+  # worker:
+  #   build: .
+  #   container_name: synthetix-erp_worker
+  #   ports:
+  #     - "3082:3000"
+  #   networks:
+  #     - synthetix-erp_network
+
+volumes:
+  synthetix_mongodb_data:
+    driver: local
+
+networks:
+  synthetix-erp_network:
+    driver: bridge
