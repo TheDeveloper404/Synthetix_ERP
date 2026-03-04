@@ -21,6 +21,20 @@ services:
       timeout: 5s
       retries: 5
 
+  redis:
+    image: redis:7-alpine
+    container_name: synthetix-erp_redis
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    networks:
+      - synthetix-erp_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   # Backend/API Service (port 3080)
   backend:
     build:
@@ -43,8 +57,11 @@ services:
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3081}
       DEMO_MODE: ${DEMO_MODE:-true}
       AGENT_PORT_BASE: ${AGENT_PORT_BASE:-3082}
+      REDIS_URL: redis://redis:6379
     depends_on:
       mongodb:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     networks:
       - synthetix-erp_network

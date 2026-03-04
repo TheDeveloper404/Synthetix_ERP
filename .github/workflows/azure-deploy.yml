@@ -1,0 +1,163 @@
+name: Build & Deploy to Azure Container Apps
+
+on:
+  push:
+    branches:
+      - main        # production
+      - staging     # staging
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options: [staging, prod]
+
+env:
+  REGISTRY: ${{ vars.ACR_LOGIN_SERVER }}          # e.g. synthetix.azurecr.io
+  IMAGE_NAME: synthetix
+  NODE_VERSION: '20'
+
+jobs:
+  # ─────────────────────────────────────────────
+  # 1. BUILD & PUSH DOCKER IMAGE
+  # ─────────────────────────────────────────────
+  build:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
+      full_image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine environment
+        id: env
+        run: |
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "env=prod" >> $GITHUB_OUTPUT
+          else
+            echo "env=staging" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Log in to ACR
+        run: az acr login --name ${{ vars.ACR_NAME }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=,format=short
+            type=ref,event=branch
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+  # ─────────────────────────────────────────────
+  # 2. DEPLOY INFRASTRUCTURE (Bicep)
+  # ─────────────────────────────────────────────
+  infra:
+    name: Deploy Infrastructure
+    runs-on: ubuntu-latest
+    needs: build
+    environment: ${{ needs.build.outputs.env || 'staging' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Determine env var
+        id: env
+        run: |
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "env=prod" >> $GITHUB_OUTPUT
+          else
+            echo "env=staging" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Deploy Bicep (subscription scope)
+        uses: azure/arm-deploy@v2
+        with:
+          scope: subscription
+          subscriptionId: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          region: ${{ vars.AZURE_LOCATION || 'eastus' }}
+          template: infra/main.bicep
+          parameters: >
+            env=${{ steps.env.outputs.env }}
+            location=${{ vars.AZURE_LOCATION || 'eastus' }}
+            containerImage=${{ needs.build.outputs.full_image }}
+            jwtSecret=${{ secrets.JWT_SECRET }}
+            openaiApiKey=${{ secrets.OPENAI_API_KEY }}
+            openaiBaseUrl=${{ vars.OPENAI_BASE_URL || 'https://api.openai.com/v1' }}
+            nextPublicBaseUrl=${{ vars.NEXT_PUBLIC_BASE_URL }}
+            corsOrigins=${{ vars.CORS_ORIGINS }}
+          deploymentName: synthetix-${{ steps.env.outputs.env }}-${{ github.run_number }}
+          failOnStdErr: false
+
+  # ─────────────────────────────────────────────
+  # 3. SMOKE TEST
+  # ─────────────────────────────────────────────
+  smoke:
+    name: Smoke Test
+    runs-on: ubuntu-latest
+    needs: [build, infra]
+
+    steps:
+      - name: Wait for container app readiness
+        run: sleep 30
+
+      - name: Health check
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            "${{ vars.NEXT_PUBLIC_BASE_URL }}/api/health" \
+            --max-time 30 --retry 5 --retry-delay 10 --retry-connrefused)
+          if [ "$STATUS" != "200" ]; then
+            echo "Health check failed with status: $STATUS"
+            exit 1
+          fi
+          echo "Health check passed (HTTP $STATUS)"
+
+  # ─────────────────────────────────────────────
+  # 4. NOTIFY ON FAILURE
+  # ─────────────────────────────────────────────
+  notify:
+    name: Notify on Failure
+    runs-on: ubuntu-latest
+    needs: [build, infra, smoke]
+    if: failure()
+
+    steps:
+      - name: Post failure notification
+        run: |
+          echo "Deployment failed on ${{ github.ref }} — run #${{ github.run_number }}"
+          # Wire up Slack/Teams/email notification here

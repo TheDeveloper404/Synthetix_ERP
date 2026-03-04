@@ -1,0 +1,40 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "env": {
+      "value": "prod"
+    },
+    "location": {
+      "value": "eastus"
+    },
+    "baseName": {
+      "value": "synthetix"
+    },
+    "containerImage": {
+      "value": "myregistry.azurecr.io/synthetix:latest"
+    },
+    "jwtSecret": {
+      "reference": {
+        "keyVault": {
+          "id": "/subscriptions/YOUR_SUBSCRIPTION_ID/resourceGroups/rg-bootstrap/providers/Microsoft.KeyVault/vaults/kv-bootstrap"
+        },
+        "secretName": "jwt-secret"
+      }
+    },
+    "openaiApiKey": {
+      "reference": {
+        "keyVault": {
+          "id": "/subscriptions/YOUR_SUBSCRIPTION_ID/resourceGroups/rg-bootstrap/providers/Microsoft.KeyVault/vaults/kv-bootstrap"
+        },
+        "secretName": "openai-api-key"
+      }
+    },
+    "nextPublicBaseUrl": {
+      "value": "https://your-app.azurefd.net"
+    },
+    "corsOrigins": {
+      "value": "https://your-app.azurefd.net"
+    }
+  }
+}

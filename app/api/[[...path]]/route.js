@@ -3,6 +3,8 @@ import { v4 as uuidv4 } from 'uuid'
 import { NextResponse } from 'next/server'
 import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
+import { redisRateLimit, blacklistToken, isTokenBlacklisted } from '../../../lib/redis.js'
+import { sendEmail, passwordResetEmail, emailVerificationEmail, approvalNotificationEmail } from '../../../lib/email.js'
 
 // ============= CONFIGURATION =============
 const isProduction = process.env.NODE_ENV === 'production'
@@ -13,9 +15,14 @@ const JWT_EXPIRES_IN = '7d'
 const DEMO_MODE = process.env.DEMO_MODE === 'true' || !process.env.OPENAI_API_KEY
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY
 const OPENAI_BASE_URL = process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1'
-const RESEND_API_KEY = process.env.RESEND_API_KEY
-const RESEND_FROM_EMAIL = process.env.RESEND_FROM_EMAIL || 'notifications@synthetix.ai'
 const AGENT_PORT_BASE = parseInt(process.env.AGENT_PORT_BASE || '3080')
+
+// ============= STRIPE CONFIG (env vars; implement billing when ready for prod) =============
+const STRIPE_PRICE_IDS = {
+  starter: process.env.STRIPE_PRICE_STARTER,
+  professional: process.env.STRIPE_PRICE_PROFESSIONAL,
+  enterprise: process.env.STRIPE_PRICE_ENTERPRISE,
+}
 
 // ============= SUBSCRIPTION TIERS =============
 const SUBSCRIPTION_TIERS = {
@@ -150,8 +157,15 @@ async function createIndexes() {
     // Password reset tokens
     await db.collection('password_resets').createIndex({ token: 1 }, { unique: true })
     await db.collection('password_resets').createIndex(
-      { created_at: 1 }, 
+      { created_at: 1 },
       { expireAfterSeconds: 3600 } // 1 hour expiry
+    )
+
+    // Email verification tokens (24 hours)
+    await db.collection('email_verifications').createIndex({ token: 1 }, { unique: true })
+    await db.collection('email_verifications').createIndex(
+      { created_at: 1 },
+      { expireAfterSeconds: 86400 } // 24 hour expiry
     )
     
     // Team members
@@ -212,7 +226,34 @@ const validators = {
     if (!value) return true // Optional
     try {
       const url = new URL(value)
-      return url.protocol === 'https:' || url.protocol === 'http:'
+      // Enforce HTTPS only in production
+      if (isProduction && url.protocol !== 'https:') return false
+      if (!['https:', 'http:'].includes(url.protocol)) return false
+
+      // Block SSRF: private, loopback, link-local, and metadata service IPs
+      const hostname = url.hostname.toLowerCase()
+
+      // Block localhost variants
+      if (hostname === 'localhost' || hostname === '0.0.0.0') return false
+
+      // Block by IP ranges (parsed as dotted-decimal IPv4)
+      const ipv4 = hostname.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/)
+      if (ipv4) {
+        const [, a, b, c, d] = ipv4.map(Number)
+        if (a === 10) return false                                    // 10.0.0.0/8
+        if (a === 172 && b >= 16 && b <= 31) return false            // 172.16.0.0/12
+        if (a === 192 && b === 168) return false                      // 192.168.0.0/16
+        if (a === 127) return false                                   // 127.0.0.0/8 loopback
+        if (a === 169 && b === 254) return false                      // 169.254.0.0/16 link-local / IMDS
+        if (a === 0) return false                                     // 0.0.0.0/8
+        if (a === 100 && b >= 64 && b <= 127) return false           // 100.64.0.0/10 shared address
+        if (a === 198 && (b === 18 || b === 19)) return false        // 198.18.0.0/15 benchmarking
+      }
+
+      // Block Azure IMDS endpoint
+      if (hostname === '169.254.169.254') return false
+
+      return true
     } catch {
       return false
     }
@@ -240,7 +281,8 @@ async function verifyPassword(password, hashedPassword) {
 }
 
 function generateToken(userId, email, orgId, role) {
-  return jwt.sign({ userId, email, orgId, role }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN })
+  const jti = uuidv4()
+  return jwt.sign({ userId, email, orgId, role, jti }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN })
 }
 
 function verifyToken(token) {
@@ -251,10 +293,14 @@ function verifyToken(token) {
   }
 }
 
-function getUserFromRequest(request) {
+async function getUserFromRequest(request) {
   const authHeader = request.headers.get('authorization')
   if (!authHeader || !authHeader.startsWith('Bearer ')) return null
-  return verifyToken(authHeader.substring(7))
+  const decoded = verifyToken(authHeader.substring(7))
+  if (!decoded) return null
+  // Check JWT blacklist (server-side logout)
+  if (decoded.jti && await isTokenBlacklisted(decoded.jti)) return null
+  return decoded
 }
 
 // ============= RBAC (Role-Based Access Control) =============
@@ -270,8 +316,8 @@ function hasPermission(role, permission) {
   return rolePerms.includes('*') || rolePerms.includes(permission)
 }
 
-function requireAuth(request, permission = 'read') {
-  const user = getUserFromRequest(request)
+async function requireAuth(request, permission = 'read') {
+  const user = await getUserFromRequest(request)
   if (!user) {
     return { error: 'Unauthorized', status: 401 }
   }
@@ -401,11 +447,16 @@ async function checkSubscriptionLimits(orgId, tier, action = 'request') {
   return { allowed: check.ok, message: check.message, usage, limits }
 }
 
-// ============= RATE LIMITING (MongoDB-based, Redis-ready) =============
+// ============= RATE LIMITING (Redis primary / MongoDB fallback) =============
 async function checkRateLimit(key, maxRequests = 10, windowSeconds = 30) {
+  // Try Redis first (sliding window, accurate)
+  const redisResult = await redisRateLimit(key, maxRequests, windowSeconds)
+  if (redisResult !== null) return redisResult
+
+  // MongoDB fallback (approximate sliding window)
   const now = Date.now()
   const windowMs = windowSeconds * 1000
-  
+
   try {
     const record = await db.collection('rate_limits').findOneAndUpdate(
       { key },
@@ -413,86 +464,38 @@ async function checkRateLimit(key, maxRequests = 10, windowSeconds = 30) {
         $push: {
           requests: {
             $each: [now],
-            $slice: -maxRequests * 2 // Keep last N*2 requests
+            $slice: -maxRequests * 2
           }
         },
         $set: { updated_at: new Date() }
       },
       { upsert: true, returnDocument: 'after' }
     )
-    
+
     const requests = record?.requests || []
     const recentRequests = requests.filter(t => now - t < windowMs)
-    
+
     if (recentRequests.length > maxRequests) {
       return { allowed: false, count: recentRequests.length, limit: maxRequests }
     }
-    
+
     return { allowed: true, count: recentRequests.length, limit: maxRequests }
   } catch (error) {
     console.error('Rate limit error:', error)
-    return { allowed: false, count: 0, limit: maxRequests } // Fail closed — safe default
+    return { allowed: false, count: 0, limit: maxRequests } // Fail-closed
   }
 }
 
-// ============= EMAIL SERVICE (Resend) =============
-async function sendEmail(to, subject, html) {
-  if (!RESEND_API_KEY) {
-    console.log('Email not sent (no RESEND_API_KEY):', { to, subject })
-    return { success: false, error: 'Email not configured' }
-  }
-  
-  try {
-    const response = await fetch('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${RESEND_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        from: RESEND_FROM_EMAIL,
-        to: [to],
-        subject,
-        html
-      })
-    })
-    
-    const data = await response.json()
-    return { success: response.ok, data }
-  } catch (error) {
-    console.error('Email error:', error)
-    return { success: false, error: error.message }
-  }
-}
-
+// ============= EMAIL SERVICE (lib/email.js — ACS / Resend / log) =============
 async function sendPasswordResetEmail(email, token, baseUrl) {
   const resetUrl = `${baseUrl}/reset-password?token=${token}`
-  const html = `
-    <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto;">
-      <h2 style="color: #4f46e5;">Reset Your Password</h2>
-      <p>You requested a password reset for your Synthetix account.</p>
-      <p>Click the button below to reset your password:</p>
-      <a href="${resetUrl}" style="display: inline-block; background: #4f46e5; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; margin: 16px 0;">Reset Password</a>
-      <p style="color: #666; font-size: 14px;">This link expires in 1 hour.</p>
-      <p style="color: #666; font-size: 14px;">If you didn't request this, ignore this email.</p>
-    </div>
-  `
-  return sendEmail(email, 'Reset Your Synthetix Password', html)
+  const { subject, html } = passwordResetEmail(resetUrl)
+  return sendEmail(email, subject, html)
 }
 
 async function sendApprovalNotificationEmail(email, agentName, keyword, approvalId) {
-  const html = `
-    <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto;">
-      <h2 style="color: #4f46e5;">Action Required: Critical Action Pending</h2>
-      <p>Agent <strong>${agentName}</strong> triggered a critical action that requires your approval.</p>
-      <div style="background: #fef3c7; border: 1px solid #f59e0b; padding: 16px; border-radius: 6px; margin: 16px 0;">
-        <p style="margin: 0; color: #92400e;"><strong>Triggered keyword:</strong> "${keyword}"</p>
-      </div>
-      <p>Please log in to your Synthetix dashboard to approve or reject this action.</p>
-      <p style="color: #666; font-size: 14px;">Approval ID: ${approvalId}</p>
-    </div>
-  `
-  return sendEmail(email, `[Synthetix] Action Required: ${agentName}`, html)
+  const { subject, html } = approvalNotificationEmail(agentName, keyword, approvalId)
+  return sendEmail(email, subject, html)
 }
 
 // ============= WEBHOOK NOTIFICATIONS =============
@@ -700,6 +703,11 @@ async function handleRoute(request, { params }) {
   try {
     const db = await connectToMongo()
 
+    // ============= HEALTH CHECK =============
+    if (route === '/health' && method === 'GET') {
+      return cors(NextResponse.json({ status: 'ok', timestamp: new Date().toISOString() }))
+    }
+
     // ============= ROOT =============
     if ((route === '/root' || route === '/') && method === 'GET') {
       return cors(NextResponse.json({ 
@@ -707,7 +715,7 @@ async function handleRoute(request, { params }) {
         version: "3.0.0",
         demo_mode: DEMO_MODE,
         endpoints: [
-          '/api/auth/register', '/api/auth/login', '/api/auth/me',
+          '/api/auth/register', '/api/auth/login', '/api/auth/logout', '/api/auth/me',
           '/api/auth/forgot-password', '/api/auth/reset-password',
           '/api/organizations', '/api/agents', '/api/policies',
           '/api/team', '/api/audit-logs', '/api/pending-approvals',
@@ -778,16 +786,50 @@ async function handleRoute(request, { params }) {
         updated_at: new Date()
       }
       await db.collection('users').insertOne(user)
-      
-      const token = generateToken(user.id, user.email, user.org_id, user.role)
-      
+
+      // Send verification email (best-effort, don't block registration)
+      try {
+        const verifyToken = uuidv4()
+        await db.collection('email_verifications').insertOne({
+          token: verifyToken,
+          user_id: user.id,
+          email,
+          created_at: new Date()
+        })
+        const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || 'http://localhost:3000'
+        const verifyUrl = `${baseUrl}/verify-email?token=${verifyToken}`
+        const { subject, html } = emailVerificationEmail(verifyUrl)
+        await sendEmail(email, subject, html)
+      } catch (e) {
+        console.error('[Register] Failed to send verification email:', e.message)
+      }
+
+      const authToken = generateToken(user.id, user.email, user.org_id, user.role)
+
       return cors(NextResponse.json({
-        message: 'Registration successful',
-        token,
+        message: 'Registration successful. Please verify your email.',
+        token: authToken,
         user: { id: user.id, email: user.email, name: user.name, org_id: user.org_id, role: user.role }
       }, { status: 201 }))
     }
-    
+
+    // ============= AUTH: VERIFY EMAIL =============
+    if (route === '/auth/verify-email' && method === 'GET') {
+      const token = request.nextUrl?.searchParams?.get('token') || new URL(request.url).searchParams.get('token')
+      if (!token) return err('Token required')
+
+      const record = await db.collection('email_verifications').findOne({ token })
+      if (!record) return err('Invalid or expired verification token', 400)
+
+      await db.collection('users').updateOne(
+        { id: record.user_id },
+        { $set: { email_verified: true, updated_at: new Date() } }
+      )
+      await db.collection('email_verifications').deleteOne({ token })
+
+      return cors(NextResponse.json({ message: 'Email verified successfully' }))
+    }
+
     // ============= AUTH: LOGIN =============
     if (route === '/auth/login' && method === 'POST') {
       const body = await request.json()
@@ -829,7 +871,7 @@ async function handleRoute(request, { params }) {
     
     // ============= AUTH: CURRENT USER =============
     if (route === '/auth/me' && method === 'GET') {
-      const auth = requireAuth(request)
+      const auth = await requireAuth(request)
       if (auth.error) return err(auth.error, auth.status)
       
       const user = await db.collection('users').findOne({ id: auth.user.userId })
@@ -897,8 +939,24 @@ async function handleRoute(request, { params }) {
       )
       
       await db.collection('password_resets').deleteOne({ token })
-      
+
       return cors(NextResponse.json({ message: 'Password reset successful' }))
+    }
+
+    // ============= AUTH: LOGOUT =============
+    if (route === '/auth/logout' && method === 'POST') {
+      const authHeader = request.headers.get('authorization')
+      if (authHeader?.startsWith('Bearer ')) {
+        const token = authHeader.substring(7)
+        const decoded = verifyToken(token)
+        if (decoded?.jti && decoded?.exp) {
+          const ttlSeconds = Math.max(0, decoded.exp - Math.floor(Date.now() / 1000))
+          if (ttlSeconds > 0) {
+            await blacklistToken(decoded.jti, ttlSeconds)
+          }
+        }
+      }
+      return cors(NextResponse.json({ message: 'Logged out successfully' }))
     }
 
     // ============= SUBSCRIPTION TIERS =============
@@ -913,9 +971,9 @@ async function handleRoute(request, { params }) {
       }))
     }
 
-    // Select subscription (after signup) — will be replaced by Stripe in Sprint 5
+    // Select FREE subscription — paid tiers go through /subscriptions/checkout (Stripe)
     if (route === '/subscriptions/select' && method === 'POST') {
-      const auth = requireAuth(request, 'write')
+      const auth = await requireAuth(request, 'write')
       if (auth.error) return err(auth.error, auth.status)
 
       const body = await request.json()
@@ -943,7 +1001,7 @@ async function handleRoute(request, { params }) {
 
     // Get subscription status and usage
     if (route === '/subscriptions/status' && method === 'GET') {
-      const auth = requireAuth(request)
+      const auth = await requireAuth(request)
       if (auth.error) return err(auth.error, auth.status)
 
       const orgId = auth.user.orgId
@@ -976,9 +1034,9 @@ async function handleRoute(request, { params }) {
       }))
     }
 
-    // Upgrade subscription — will be replaced by Stripe in Sprint 5
+    // Upgrade subscription (dev only) — production upgrades go through Stripe /subscriptions/checkout
     if (route === '/subscriptions/upgrade' && method === 'POST') {
-      const auth = requireAuth(request, 'write')
+      const auth = await requireAuth(request, 'write')
       if (auth.error) return err(auth.error, auth.status)
 
       const body = await request.json()
@@ -1023,9 +1081,45 @@ async function handleRoute(request, { params }) {
       return cors(NextResponse.json({ message: 'Subscription upgraded', tier, limits }))
     }
 
+    // ============= STRIPE BILLING (placeholders — implement when ready for prod) =============
+
+    // POST /subscriptions/checkout — creates a Stripe Checkout Session for paid plans
+    // TODO (when ready for prod):
+    //   1. const stripe = new Stripe(process.env.STRIPE_SECRET_KEY)
+    //   2. Find or create stripe_customer_id on the org
+    //   3. const session = await stripe.checkout.sessions.create({ mode: 'subscription', line_items: [{ price: STRIPE_PRICE_IDS[tier], quantity: 1 }], ... })
+    //   4. return cors(NextResponse.json({ url: session.url }))
+    if (route === '/subscriptions/checkout' && method === 'POST') {
+      const auth = await requireAuth(request, 'write')
+      if (auth.error) return err(auth.error, auth.status)
+      return err('Stripe billing not yet configured. Use /subscriptions/select for the free plan or contact support.', 501)
+    }
+
+    // POST /subscriptions/portal — redirects to Stripe Customer Portal (manage billing, cancel, change card)
+    // TODO (when ready for prod):
+    //   1. const stripe = new Stripe(process.env.STRIPE_SECRET_KEY)
+    //   2. Fetch org.stripe_customer_id from DB
+    //   3. const session = await stripe.billingPortal.sessions.create({ customer: stripe_customer_id, return_url: baseUrl })
+    //   4. return cors(NextResponse.json({ url: session.url }))
+    if (route === '/subscriptions/portal' && method === 'POST') {
+      const auth = await requireAuth(request, 'write')
+      if (auth.error) return err(auth.error, auth.status)
+      return err('Stripe billing portal not yet configured.', 501)
+    }
+
+    // POST /webhooks/stripe — receives Stripe events (subscription changes, payment failures, etc.)
+    // TODO (when ready for prod):
+    //   IMPORTANT: must read rawBody as text (not JSON) for signature verification
+    //   const sig = request.headers.get('stripe-signature')
+    //   const event = stripe.webhooks.constructEvent(rawBody, sig, process.env.STRIPE_WEBHOOK_SECRET)
+    //   Handle: checkout.session.completed, customer.subscription.updated, customer.subscription.deleted, invoice.payment_failed
+    if (route === '/webhooks/stripe' && method === 'POST') {
+      return cors(NextResponse.json({ received: true }))
+    }
+
     // ============= ORGANIZATIONS =============
     if (route === '/organizations' && method === 'GET') {
-      const auth = requireAuth(request)
+      const auth = await requireAuth(request)
       if (auth.error) return err(auth.error, auth.status)
       // Each user sees only their own org
       const query = { id: auth.user.orgId }
@@ -1035,7 +1129,7 @@ async function handleRoute(request, { params }) {
 
     if (route === '/organizations' && method === 'POST') {
       // Organization creation is part of register flow — protected by register rate limit
-      const auth = requireAuth(request, 'write')
+      const auth = await requireAuth(request, 'write')
       if (auth.error) return err(auth.error, auth.status)
 
       const body = await request.json()
@@ -1063,7 +1157,7 @@ async function handleRoute(request, { params }) {
     }
 
     if (route.match(/^\/organizations\/[^/]+$/) && method === 'GET') {
-      const auth = requireAuth(request)
+      const auth = await requireAuth(request)
       if (auth.error) return err(auth.error, auth.status)
 
       const orgId = path[1]
@@ -1080,7 +1174,7 @@ async function handleRoute(request, { params }) {
     }
 
     if (route.match(/^\/organizations\/[^/]+$/) && method === 'PUT') {
-      const auth = requireAuth(request, 'write')
+      const auth = await requireAuth(request, 'write')
       if (auth.error) return err(auth.error, auth.status)
 
       const orgId = path[1]
@@ -1104,7 +1198,7 @@ async function handleRoute(request, { params }) {
 
     // ============= AGENTS =============
     if (route === '/agents' && method === 'GET') {
-      const auth = requireAuth(request)
+      const auth = await requireAuth(request)
       if (auth.error) return err(auth.error, auth.status)
       // Always filter by the authenticated user's org — ignore any org_id query param
       const agents = await db.collection('agents').find({ org_id: auth.user.orgId }).toArray()
@@ -1112,7 +1206,7 @@ async function handleRoute(request, { params }) {
     }
 
     if (route === '/agents' && method === 'POST') {
-      const auth = requireAuth(request, 'write')
+      const auth = await requireAuth(request, 'write')
       if (auth.error) return err(auth.error, auth.status)
 
       const body = await request.json()
@@ -1163,7 +1257,7 @@ async function handleRoute(request, { params }) {
     }
 
     if (route.match(/^\/agents\/[^/]+$/) && method === 'GET') {
-      const auth = requireAuth(request)
+      const auth = await requireAuth(request)
       if (auth.error) return err(auth.error, auth.status)
 
       const agentId = path[1]
@@ -1178,7 +1272,7 @@ async function handleRoute(request, { params }) {
     }
 
     if (route.match(/^\/agents\/[^/]+$/) && method === 'PUT') {
-      const auth = requireAuth(request, 'manage_agents')
+      const auth = await requireAuth(request, 'manage_agents')
       if (auth.error) return err(auth.error, auth.status)
 
       const agentId = path[1]
@@ -1204,7 +1298,7 @@ async function handleRoute(request, { params }) {
     }
 
     if (route.match(/^\/agents\/[^/]+$/) && method === 'DELETE') {
-      const auth = requireAuth(request, 'manage_agents')
+      const auth = await requireAuth(request, 'manage_agents')
       if (auth.error) return err(auth.error, auth.status)
 
       const agentId = path[1]
@@ -1222,7 +1316,7 @@ async function handleRoute(request, { params }) {
 
     // Kill agent
     if (route.match(/^\/agents\/[^/]+\/kill$/) && method === 'POST') {
-      const auth = requireAuth(request, 'manage_agents')
+      const auth = await requireAuth(request, 'manage_agents')
       if (auth.error) return err(auth.error, auth.status)
 
       const agentId = path[1]
@@ -1264,7 +1358,7 @@ async function handleRoute(request, { params }) {
 
     // Generate API key
     if (route.match(/^\/agents\/[^/]+\/api-key$/) && method === 'POST') {
-      const auth = requireAuth(request, 'manage_agents')
+      const auth = await requireAuth(request, 'manage_agents')
       if (auth.error) return err(auth.error, auth.status)
 
       const agentId = path[1]
@@ -1285,7 +1379,7 @@ async function handleRoute(request, { params }) {
 
     // ============= TEAM MANAGEMENT =============
     if (route === '/team' && method === 'GET') {
-      const auth = requireAuth(request)
+      const auth = await requireAuth(request)
       if (auth.error) return err(auth.error, auth.status)
       // Always return members of the authenticated user's org
       const members = await db.collection('team_members').find({ org_id: auth.user.orgId }).toArray()
@@ -1293,7 +1387,7 @@ async function handleRoute(request, { params }) {
     }
 
     if (route === '/team' && method === 'POST') {
-      const auth = requireAuth(request, 'write')
+      const auth = await requireAuth(request, 'write')
       if (auth.error) return err(auth.error, auth.status)
 
       const body = await request.json()
@@ -1321,7 +1415,7 @@ async function handleRoute(request, { params }) {
     }
 
     if (route.match(/^\/team\/[^/]+$/) && method === 'PUT') {
-      const auth = requireAuth(request, 'write')
+      const auth = await requireAuth(request, 'write')
       if (auth.error) return err(auth.error, auth.status)
 
       const memberId = path[1]
@@ -1350,7 +1444,7 @@ async function handleRoute(request, { params }) {
     }
 
     if (route.match(/^\/team\/[^/]+$/) && method === 'DELETE') {
-      const auth = requireAuth(request, 'write')
+      const auth = await requireAuth(request, 'write')
       if (auth.error) return err(auth.error, auth.status)
 
       const memberId = path[1]
@@ -1366,14 +1460,14 @@ async function handleRoute(request, { params }) {
 
     // ============= POLICIES =============
     if (route === '/policies' && method === 'GET') {
-      const auth = requireAuth(request)
+      const auth = await requireAuth(request)
       if (auth.error) return err(auth.error, auth.status)
       const policies = await db.collection('policies').find({ org_id: auth.user.orgId }).toArray()
       return cors(NextResponse.json(policies.map(({ _id, ...rest }) => rest)))
     }
 
     if (route === '/policies' && method === 'POST') {
-      const auth = requireAuth(request, 'write')
+      const auth = await requireAuth(request, 'write')
       if (auth.error) return err(auth.error, auth.status)
 
       const body = await request.json()
@@ -1398,7 +1492,7 @@ async function handleRoute(request, { params }) {
     }
 
     if (route.match(/^\/policies\/[^/]+$/) && method === 'PUT') {
-      const auth = requireAuth(request, 'manage_policies')
+      const auth = await requireAuth(request, 'manage_policies')
       if (auth.error) return err(auth.error, auth.status)
 
       const policyId = path[1]
@@ -1430,7 +1524,7 @@ async function handleRoute(request, { params }) {
 
     // ============= AUDIT LOGS =============
     if (route === '/audit-logs' && method === 'GET') {
-      const auth = requireAuth(request)
+      const auth = await requireAuth(request)
       if (auth.error) return err(auth.error, auth.status)
 
       const url = new URL(request.url)
@@ -1452,7 +1546,7 @@ async function handleRoute(request, { params }) {
 
     // ============= PENDING APPROVALS =============
     if (route === '/pending-approvals' && method === 'GET') {
-      const auth = requireAuth(request)
+      const auth = await requireAuth(request)
       if (auth.error) return err(auth.error, auth.status)
       // Always scope to authenticated user's org
       const approvals = await db.collection('pending_approvals')
@@ -1462,7 +1556,7 @@ async function handleRoute(request, { params }) {
     }
 
     if (route.match(/^\/pending-approvals\/[^/]+$/) && method === 'POST') {
-      const auth = requireAuth(request, 'approve')
+      const auth = await requireAuth(request, 'approve')
       if (auth.error) return err(auth.error, auth.status)
 
       const approvalId = path[1]
@@ -1499,7 +1593,7 @@ async function handleRoute(request, { params }) {
 
     // ============= WEBHOOKS =============
     if (route === '/webhooks' && method === 'GET') {
-      const auth = requireAuth(request)
+      const auth = await requireAuth(request)
       if (auth.error) return err(auth.error, auth.status)
 
       const org = await db.collection('organizations').findOne({ id: auth.user.orgId })
@@ -1515,7 +1609,7 @@ async function handleRoute(request, { params }) {
     }
 
     if (route === '/webhooks' && method === 'POST') {
-      const auth = requireAuth(request, 'write')
+      const auth = await requireAuth(request, 'write')
       if (auth.error) return err(auth.error, auth.status)
 
       const body = await request.json()
@@ -1542,7 +1636,7 @@ async function handleRoute(request, { params }) {
     }
 
     if (route === '/webhooks/test' && method === 'POST') {
-      const auth = requireAuth(request, 'write')
+      const auth = await requireAuth(request, 'write')
       if (auth.error) return err(auth.error, auth.status)
 
       const body = await request.json()
@@ -1583,7 +1677,7 @@ async function handleRoute(request, { params }) {
 
     // ============= ANALYTICS =============
     if (route === '/analytics/costs' && method === 'GET') {
-      const auth = requireAuth(request)
+      const auth = await requireAuth(request)
       if (auth.error) return err(auth.error, auth.status)
 
       const url = new URL(request.url)
@@ -1657,7 +1751,7 @@ async function handleRoute(request, { params }) {
     }
 
     if (route === '/analytics/usage' && method === 'GET') {
-      const auth = requireAuth(request)
+      const auth = await requireAuth(request)
       if (auth.error) return err(auth.error, auth.status)
 
       const url = new URL(request.url)
@@ -1701,7 +1795,7 @@ async function handleRoute(request, { params }) {
     }
 
     if (route === '/analytics/pii' && method === 'GET') {
-      const auth = requireAuth(request)
+      const auth = await requireAuth(request)
       if (auth.error) return err(auth.error, auth.status)
 
       const url = new URL(request.url)
@@ -1740,7 +1834,7 @@ async function handleRoute(request, { params }) {
 
     // ============= DASHBOARD STATS =============
     if (route === '/dashboard/stats' && method === 'GET') {
-      const auth = requireAuth(request)
+      const auth = await requireAuth(request)
       if (auth.error) return err(auth.error, auth.status)
 
       const orgId = auth.user.orgId

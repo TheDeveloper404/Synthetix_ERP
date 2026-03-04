@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node --input-type=module --eval \"import ''./app/api/[[...path]]/route.js''\")",
+      "Bash(node --check \"app/api/[[...path]]/route.js\")",
+      "Bash(yarn audit)",
+      "Bash(yarn audit --json)",
+      "Bash(yarn info next versions --json)",
+      "Bash(node -e \"const d=require\\(''fs''\\).readFileSync\\(''/dev/stdin'',''utf8''\\); const versions=JSON.parse\\(d\\).data; const v14=versions.filter\\(v=>v.startsWith\\(''14.''\\)\\); console.log\\(''Latest 14.x:'', v14[v14.length-1]\\);\")",
+      "Bash(yarn info next version)",
+      "Bash(yarn info next@14 version)",
+      "Bash(yarn info next dist-tags)",
+      "Bash(yarn info axios dist-tags)",
+      "Bash(yarn upgrade next axios --ignore-scripts)",
+      "Bash(yarn install --ignore-scripts)",
+      "Bash(test -f /d/work_mode/Synthetix_ERP/Dockerfile)",
+      "Bash(wc -l /d/work_mode/Synthetix_ERP/app/api/[[...path]]/route.js)",
+      "Bash(head -100 /d/work_mode/Synthetix_ERP/app/api/[[...path]]/route.js)",
+      "Bash(grep -n \"export.*GET\\\\|/health\\\\|function.*health\" /d/work_mode/Synthetix_ERP/app/api/[[...path]]/route.js)",
+      "Bash(grep -n \"handleRoute\\\\|GET.*health\\\\|''/health\" /d/work_mode/Synthetix_ERP/app/api/[[...path]]/route.js)",
+      "Bash(grep -n \"health\\\\|GET.*health\" /d/work_mode/Synthetix_ERP/app/api/[[...path]]/route.js)",
+      "Bash(yarn add stripe --ignore-scripts)"
+    ]
+  }
+}
